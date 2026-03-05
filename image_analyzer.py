@@ -1,111 +1,68 @@
 """
-Image Deepfake Analyzer (using a real detection model)
-------------------------------------------------------
-Fixed version with proper imports and real verdict logic.
-Uses a lightweight pre-trained model from Hugging Face.
+image_analyzer.py - AuthenticityAI
+Image & video frame deepfake detection module
+Uses transformers pipeline (ViT or similar) with GPU/CPU support
 """
 
-import torch
-from PIL import Image
 import cv2
-import numpy as np
 from transformers import pipeline
+from device_utils import get_device  # shared device detection
 
-# Global model (loaded lazily – only once)
+# Global detector (lazy load)
 _detector = None
 
-
-def get_detector():
-    """Lazy-load the deepfake detection model (only downloads once)"""
+def image_analyzer(image_path: str) -> dict:
+    """
+    Analyze a single image for deepfake indicators.
+    Returns: {"verdict": str, "confidence": float, "final_score": float}
+    """
     global _detector
-    if _detector is None:
-        print("[image_analyzer] Loading deepfake detection model (may take 1–2 min first time)...")
-        try:
-            _detector = pipeline(
-                "image-classification",
-                model="dima806/deepfake_vs_real_image_detection",
-                device=0 if torch.cuda.is_available() else -1  # GPU if RTX 3050 is ready
-            )
-            print("[image_analyzer] Model loaded successfully")
-        except Exception as e:
-            print(f"[image_analyzer] Model load failed: {e}")
-            _detector = None
-    return _detector
 
-
-def image_analyzer(input_data):
-    """
-    Analyze image for deepfake.
-
-    Args:
-        input_data: str (file path) or np.ndarray (webcam frame)
-
-    Returns:
-        dict with verdict, confidence, etc.
-    """
-    detector = get_detector()
-    if detector is None:
-        return {
-            "verdict": "ERROR",
-            "confidence": 0.0,
-            "ai_score": 0.0,
-            "details": "Failed to load deepfake detection model"
-        }
+    # Load device once
+    device, device_name = get_device()
 
     try:
-        # Handle both path and numpy array (from webcam)
-        if isinstance(input_data, str):
-            # File path
-            img_rgb = cv2.imread(input_data)
-            if img_rgb is None:
-                raise ValueError("Could not read image file")
-            img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGB)
-        else:
-            # Already numpy array (BGR from OpenCV)
-            img_rgb = cv2.cvtColor(input_data, cv2.COLOR_BGR2RGB)
+        if _detector is None:
+            print(f"[Image Analyzer] Loading deepfake detection model on {device.upper()} ({device_name})...")
+            _detector = pipeline(
+                "image-classification",
+                model="your-image-deepfake-model",  # ← replace with actual model, e.g. "deepfake-detection-model"
+                device=0 if device == "cuda" else -1
+            )
+            print(f"[Image Analyzer] Model loaded successfully on {device.upper()}")
 
-        # Convert to PIL Image (transformers expects PIL)
-        img_pil = Image.fromarray(img_rgb)
+        # Load and preprocess image
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Failed to load image: {image_path}")
+
+        # Convert BGR (OpenCV) to RGB
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # Run inference
-        results = detector(img_pil)
+        results = _detector(img_rgb)
 
+        # Assume model returns list of dicts: [{'label': 'REAL', 'score': 0.92}, ...]
         # Take top prediction
         top = results[0]
-        label = top["label"].upper()  # usually "Real" or "Fake"
-        confidence = top["score"]  # 0.0–1.0
+        verdict = top['label'].upper()
+        confidence = top['score']
 
-        # Convert to our format
-        if "REAL" in label or "AUTHENTIC" in label:
-            verdict = "REAL"
-            ai_score = confidence
-        else:
-            verdict = "DEEPFAKE"
-            ai_score = 1 - confidence
+        # Map to your desired format
+        final_score = confidence  # can be adjusted with logic
 
         return {
             "verdict": verdict,
-            "confidence": round(confidence, 4),
-            "ai_score": round(ai_score, 4),
-            "details": f"Model: {top['label']} ({confidence:.1%})",
-            "raw_results": results  # optional – for debugging
+            "confidence": confidence,
+            "final_score": final_score,
+            "details": results
         }
 
     except Exception as e:
+        print(f"[Image Analyzer ERROR] {str(e)}")
         return {
             "verdict": "ERROR",
             "confidence": 0.0,
-            "ai_score": 0.0,
-            "details": f"Analysis failed: {str(e)}"
+            "final_score": 0.0,
+            "details": str(e)
         }
-
-
-# Optional: Quick test when run directly
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1:
-        result = image_analyzer(sys.argv[1])
-        print(result)
-    else:
-        print("Usage: python image_analyzer.py <image_path.jpg>")
