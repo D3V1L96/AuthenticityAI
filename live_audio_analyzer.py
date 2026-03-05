@@ -1,118 +1,106 @@
 """
-Real-Time Audio Deepfake Analyzer (2026 Optimized)
--------------------------------------------------
-Uses fine-tuned Wav2Vec2 for live microphone deepfake detection.
-Integrates with webcam live mode via threading.
-Detects synthetic/cloned voices in 1-3 sec chunks.
+live_audio_analyzer.py - AuthenticityAI
+Real-time microphone audio deepfake detection
+Uses transformers pipeline (Wav2Vec2) with GPU/CPU support
 """
 
+import time
 import threading
 import queue
-import time
+import sounddevice as sd
 import numpy as np
-import pyaudio
-import soundfile as sf
-import librosa
+import scipy.io.wavfile as wavfile
+import tempfile
+import os
 from transformers import pipeline
-import torch
+from device_utils import get_device  # shared device detection
 
-# Global audio result queue (shared with main loop)
-audio_result_queue = queue.Queue(maxsize=1)
-
-# Audio capture params (16kHz for model)
-CHUNK_SIZE = 1024
-SAMPLE_RATE = 16000
-CHANNELS = 1
-CHUNK_DURATION_SEC = 2  # Analyze every 2 seconds
-
-# Model (Hugging Face fine-tuned for deepfake audio)
+# Global variables
 _detector = None
-_device = "cuda" if torch.cuda.is_available() else "cpu"
+audio_result_queue = queue.Queue()
+stop_event = threading.Event()
+CHUNK_DURATION_SEC = 2.0  # analyze every 2 seconds of audio
 
 def load_detector():
-    """Lazy load the audio deepfake model"""
     global _detector
     if _detector is None:
-        print("[Audio Analyzer] Loading Wav2Vec2 deepfake model (first time: 1-2 min)...")
+        device, device_name = get_device()
+        print(f"[Audio Analyzer] Loading Wav2Vec2 model on {device.upper()} ({device_name})...")
         try:
             _detector = pipeline(
                 "audio-classification",
-                model="garystafford/wav2vec2-deepfake-voice-detector",
-                device=_device
+                model="garystafford/wav2vec2-deepfake-voice-detector",  # or your preferred model
+                device=0 if device == "cuda" else -1
             )
-            print("[Audio Analyzer] Model loaded on", _device.upper())
+            print(f"[Audio Analyzer] Model loaded successfully on {device.upper()}")
         except Exception as e:
-            print(f"[Audio Analyzer] Load failed: {e}")
+            print(f"[Audio Analyzer] Model load failed: {e}")
             _detector = None
     return _detector
 
+def audio_callback(indata, frames, time_info, status):
+    """Called by sounddevice for each audio block"""
+    if status:
+        print(f"[Audio Callback] Status: {status}")
+    # Put audio data into a queue or process directly
+    # For simplicity, we'll collect in a buffer in live_audio_thread
+
 def live_audio_thread(stop_event):
-    """Thread for real-time mic capture & deepfake analysis"""
-    detector = load_detector()
-    if detector is None:
-        audio_result_queue.put({"verdict": "ERROR", "confidence": 0.0, "details": "Model not loaded"})
-        return
+    """Background thread for continuous mic capture & analysis"""
+    load_detector()  # ensure model is loaded
 
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paFloat32,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=CHUNK_SIZE
-    )
+    fs = 16000  # sample rate
+    channels = 1
+    chunk_size = int(fs * CHUNK_DURATION_SEC)
 
-    print("[Audio Analyzer] Live mic detection started...")
+    print("[Audio Thread] Starting microphone capture...")
 
-    frames = []
-    start_time = time.time()
+    def stream_gen():
+        with sd.InputStream(samplerate=fs, channels=channels, dtype='float32', blocksize=chunk_size,
+                            callback=audio_callback):
+            while not stop_event.is_set():
+                time.sleep(0.1)
 
-    while not stop_event.is_set():
-        data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-        frames.append(np.frombuffer(data, dtype=np.float32))
+    # Use a buffer to collect audio
+    audio_buffer = []
 
-        # Analyze every CHUNK_DURATION_SEC
-        if time.time() - start_time >= CHUNK_DURATION_SEC:
-            # Save temp wav (model needs file or array)
-            temp_path = "temp_mic_chunk.wav"
-            with sf.SoundFile(temp_path, mode='w', samplerate=SAMPLE_RATE, channels=CHANNELS) as f:
-                f.write(np.concatenate(frames))
+    def process_audio():
+        while not stop_event.is_set():
+            # Wait for enough data (simplified)
+            time.sleep(CHUNK_DURATION_SEC)
+            if len(audio_buffer) >= chunk_size:
+                chunk = np.array(audio_buffer[:chunk_size], dtype=np.float32)
+                audio_buffer[:] = audio_buffer[chunk_size:]
 
-            # Resample if needed (though already 16kHz)
-            audio, sr = librosa.load(temp_path, sr=SAMPLE_RATE, mono=True)
+                # Save to temp wav
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    wavfile.write(tmp.name, fs, chunk)
+                    tmp_path = tmp.name
 
-            try:
-                # Inference
-                results = detector(audio)
-                top = max(results, key=lambda x: x['score'])
-                label = top["label"].upper()  # "bonafide" (real) or "spoof" (fake)
-                confidence = top["score"]
-
-                if "BONAFIDE" in label or "REAL" in label:
-                    verdict = "REAL"
-                    ai_score = confidence
+                # Analyze
+                detector = load_detector()
+                if detector is None:
+                    audio_result_queue.put({"verdict": "ERROR", "confidence": 0.0})
                 else:
-                    verdict = "DEEPFAKE"
-                    ai_score = 1 - confidence
+                    try:
+                        results = detector(tmp_path)
+                        top = results[0]
+                        verdict = top['label'].upper()
+                        confidence = top['score']
+                        audio_result_queue.put({"verdict": verdict, "confidence": confidence})
+                    except Exception as e:
+                        print(f"[Audio Analysis ERROR] {e}")
+                        audio_result_queue.put({"verdict": "ERROR", "confidence": 0.0})
 
-                audio_result_queue.put({
-                    "verdict": verdict,
-                    "confidence": round(confidence, 4),
-                    "ai_score": round(ai_score, 4),
-                    "details": f"Model: {top['label']} ({confidence:.1%})"
-                })
-            except Exception as e:
-                audio_result_queue.put({
-                    "verdict": "ERROR",
-                    "confidence": 0.0,
-                    "details": str(e)
-                })
+                os.unlink(tmp_path)
 
-            # Reset for next chunk
-            frames = []
-            start_time = time.time()
+    # Start audio stream in background
+    stream_thread = threading.Thread(target=stream_gen, daemon=True)
+    stream_thread.start()
 
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    print("[Audio Analyzer] Live mic stopped.")
+    # Start processing thread
+    process_thread = threading.Thread(target=process_audio, daemon=True)
+    process_thread.start()
+
+    stop_event.wait()
+    print("[Audio Thread] Stopped.")
